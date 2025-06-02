@@ -1,0 +1,38 @@
+# File: .github/workflows/telegram_alert.yml
+
+name: Intraday‐Telegram‐Alert
+
+# Run every weekday (Mon–Fri) at 9:30 AM IST.
+# GitHub Actions uses UTC for cron. 9:30 AM IST = 04:00 AM UTC.
+on:
+  schedule:
+    - cron: '0 4 * * 1-5'   # 04:00 UTC Mon–Fri → 09:30 IST
+
+jobs:
+  send_intraday_picks:
+    name: Compute and Telegram‐Alert Intraday Picks
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1) Check out the repo where the script lives
+      - uses: actions/checkout@v3
+
+      # 2) Set up Python 3.x
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      # 3) Install dependencies
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas nsepython requests
+
+      # 4) Run the Python script
+      - name: Run Intraday Picks Script
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python nse_intraday_picks.py
