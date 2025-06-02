@@ -6,6 +6,9 @@ import math
 import requests
 from nsepython import *
 
+from nsepython import index_constituents
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. CONFIGURATION (Tweak if needed)
 # ─────────────────────────────────────────────────────────────────────────────
