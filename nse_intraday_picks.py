@@ -1,10 +1,8 @@
-# File: nse_intraday_picks.py
-
 import pandas as pd
 import datetime
 import math
 import requests
-from nsepython import get_quote, fut_chain_oi
+from nsepython import nse_eq, nse_fno
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. CONFIGURATION
@@ -24,8 +22,6 @@ SECTOR_MIN_COUNT    = 3            # Require ≥3 stocks in the same sector to t
 # 2. HARD-CODED NIFTY 200 LIST
 # ─────────────────────────────────────────────────────────────────────────────
 
-# This is the full list of NIFTY 200 symbols (as traded on NSE).
-# The script will loop over all these tickers at 09:30 AM IST.
 NIFTY200_SYMBOLS = [
     "3MINDIA","AARTIDRUGS","AARTIIND","ABB","ABCAPITAL","ABFRL","ACC","ADANIENT","ADANIPORTS",
     "ADANITRANS","AIAENG","AJANTPHARM","AKZOINDIA","ALEMBICLTD","ALKEM","ALKYLAMINE","ALLCARGO",
@@ -55,7 +51,6 @@ NIFTY200_SYMBOLS = [
 # 3. TELEGRAM BOT SETUP
 # ─────────────────────────────────────────────────────────────────────────────
 
-# These environment variables will be injected by GitHub Actions
 TELEGRAM_BOT_TOKEN = None
 TELEGRAM_CHAT_ID   = None
 
@@ -100,29 +95,32 @@ def fetch_quote_and_oi(symbol):
     Returns a dict { 'symbol', 'cmp', 'pct_change', 'industry', 'oi_pct_change' }
     or None if any error occurs.
     """
+    # 1) Equity quote via nse_eq(...)
     try:
-        q = get_quote(symbol)
-        cmp_price    = float(q['lastPrice'])
-        prev_close   = float(q['previousClose'])
-        pct_change   = ((cmp_price - prev_close) / prev_close) * 100
-        industry     = q.get('industry', 'Unknown')
+        q = nse_eq(symbol)
+        cmp_price  = float(q["priceInfo"]["lastPrice"])
+        prev_close = float(q["priceInfo"]["close"])
+        pct_change = ((cmp_price - prev_close) / prev_close) * 100
+        industry   = q["metadata"].get("pdSectorInd", "Unknown")
     except Exception:
         return None
 
+    # 2) F&O‐chain via nse_fno(...)
     try:
-        chain_df, _ = fut_chain_oi(symbol)
-        oi_today       = chain_df['OI'].sum()
-        oi_prev_day    = chain_df['OI (Previous Day)'].sum()
-        oi_pct_change  = ((oi_today - oi_prev_day) / oi_prev_day) * 100 if oi_prev_day > 0 else 0.0
+        fno = nse_fno(symbol)
+        # Sum up "openInterest" for today vs yesterday
+        oi_today    = sum(item.get("openInterest", 0) for item in fno["data"])
+        oi_prev_day = sum((item.get("openInterest", 0) - item.get("changeInOI", 0)) for item in fno["data"])
+        oi_pct_change = ((oi_today - oi_prev_day) / oi_prev_day) * 100 if oi_prev_day > 0 else 0.0
     except Exception:
         oi_pct_change = 0.0
 
     return {
-        'symbol':        symbol,
-        'cmp':           cmp_price,
-        'pct_change':    pct_change,
-        'industry':      industry,
-        'oi_pct_change': oi_pct_change
+        "symbol":        symbol,
+        "cmp":           cmp_price,
+        "pct_change":    pct_change,
+        "industry":      industry,
+        "oi_pct_change": oi_pct_change
     }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -146,7 +144,7 @@ def main():
         if not info:
             continue
         # Filter 1: % change vs prev close ≥ PREMKT_THRESHOLD
-        if info['pct_change'] >= PREMKT_THRESHOLD:
+        if info["pct_change"] >= PREMKT_THRESHOLD:
             data.append(info)
 
     if not data:
@@ -157,7 +155,7 @@ def main():
     df = pd.DataFrame(data)
 
     # 4) Step 3: “Momentum sector” filter (≥ SECTOR_MIN_COUNT winners in the same industry)
-    sector_counts = df['industry'].value_counts()
+    sector_counts = df["industry"].value_counts()
     momentum_sectors = sector_counts[sector_counts >= SECTOR_MIN_COUNT].index.tolist()
     if not momentum_sectors:
         msg = (
@@ -169,14 +167,14 @@ def main():
 
     # Pick the single sector with the highest count
     chosen_sector = sector_counts.idxmax()
-    df = df[df['industry'] == chosen_sector].copy()
+    df = df[df["industry"] == chosen_sector].copy()
     if df.empty:
         msg = f"⚠️ After sector filter, 0 stocks remain in {chosen_sector}."
         send_telegram_message(msg)
         return
 
     # 5) Step 4: OI filter ≥ OI_THRESHOLD
-    df = df[df['oi_pct_change'] >= OI_THRESHOLD].copy()
+    df = df[df["oi_pct_change"] >= OI_THRESHOLD].copy()
     if df.empty:
         msg = (
             f"⚠️ No stocks in sector '{chosen_sector}' have OI Δ ≥ {OI_THRESHOLD:.1f}% at 09:30.\n"
@@ -186,7 +184,7 @@ def main():
         return
 
     # 6) Sort by pct_change (descending) and pick top MAX_SYMBOLS_PER_DAY
-    df = df.sort_values(by='pct_change', ascending=False).head(MAX_SYMBOLS_PER_DAY)
+    df = df.sort_values(by="pct_change", ascending=False).head(MAX_SYMBOLS_PER_DAY)
 
     # 7) Build the Markdown Telegram message
     header = f"🟢 *9:30 Intraday Picks for {datetime.date.today().isoformat()}*\n"
@@ -194,8 +192,8 @@ def main():
 
     lines = []
     for _, row in df.iterrows():
-        sym   = row['symbol']
-        cmp_p = row['cmp']
+        sym   = row["symbol"]
+        cmp_p = row["cmp"]
         sl    = round(cmp_p * (1 - SL_FACTOR), 2)
         tgt   = round(cmp_p * (1 + TARGET_FACTOR), 2)
         qty   = math.floor((MARGIN_PER_TRADE * LEVERAGE) / cmp_p)
@@ -215,11 +213,11 @@ def main():
         )
 
     footer = (
-        "\n⚠️ *Remember:*  \n"
-        " • Place a *Bracket‐Order* if your broker supports it (Groww, AngelOne, Dhan).  \n"
-        " • If no BO, place market/limit buy → set SL at above SL.  \n"
-        " • Move SL to breakeven at +1.5%; trail SL by –1% once +2% hits.  \n"
-        " • *Exit all positions by 10:30 AM* IST if neither SL nor target is hit.  \n"
+        "\n⚠️ *Remember:*  ￼\n"
+        " • Place a *Bracket‐Order* if your broker supports it (Groww, AngelOne, Dhan).  ￼\n"
+        " • If no BO, place market/limit buy → set SL at above SL.  ￼\n"
+        " • Move SL to breakeven at +1.5%; trail SL by –1% once +2% hits.  ￼\n"
+        " • *Exit all positions by 10:30 AM* IST if neither SL nor target is hit.  ￼\n"
         " • Stop trading for the day if you lose 2 full SLs (~₹1,500–₹2,000)."
     )
 
