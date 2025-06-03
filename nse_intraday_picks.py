@@ -63,7 +63,7 @@ def send_telegram_message(text: str):
         print("⚠️ Failed to send Telegram message:", resp.text)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4. HELPERS FOR NSE DATA (with debug prints)
+# 4. HELPERS FOR NSE DATA (with more checks)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def fetch_quote_and_oi(symbol):
@@ -80,25 +80,59 @@ def fetch_quote_and_oi(symbol):
     # 1) Equity quote via nse_eq(...)
     try:
         q = nse_eq(symbol)
+    except Exception as e:
+        print(f"❌ [{symbol}] Exception calling nse_eq: {e}")
+        return None
+
+    # If "priceInfo" is missing, dump the top‐level keys and skip
+    if "priceInfo" not in q:
+        top_keys = list(q.keys())
+        snippet = {k: q.get(k) for k in top_keys[:3]}  # show first 3 keys
+        print(f"⚠️ [{symbol}] Unexpected response from nse_eq → top‐level keys = {top_keys}")
+        print(f"    Snippet of returned JSON (first 3 items): {snippet}\n")
+        return None
+
+    try:
         cmp_price  = float(q["priceInfo"]["lastPrice"])
         prev_close = float(q["priceInfo"]["close"])
         pct_change = ((cmp_price - prev_close) / prev_close) * 100
-        industry   = q["metadata"].get("pdSectorInd", "Unknown")
+        industry   = q.get("metadata", {}).get("pdSectorInd", "Unknown")
     except Exception as e:
-        print(f"❌ [{symbol}] Failed to fetch equity quote: {e}")
+        print(f"❌ [{symbol}] Error parsing priceInfo/metadata: {e}")
         return None
 
     # 2) F&O chain via nse_fno(...)
+    oi_pct_change = 0.0
     try:
         fno = nse_fno(symbol)
-        oi_today    = sum(item.get("openInterest", 0) for item in fno["data"])
-        oi_prev_day = sum((item.get("openInterest", 0) - item.get("changeInOI", 0)) for item in fno["data"])
-        oi_pct_change = ((oi_today - oi_prev_day) / oi_prev_day) * 100 if oi_prev_day > 0 else 0.0
     except Exception as e:
-        print(f"❌ [{symbol}] Failed to fetch F&O chain or compute OI: {e}")
-        oi_pct_change = 0.0  # still return the quote data, but OI change is zero
+        print(f"❌ [{symbol}] Exception calling nse_fno: {e}")
+        fno = None
 
-    # Debug print of raw values
+    if not fno or "data" not in fno:
+        # Either fno is None or missing "data"
+        if fno is not None:
+            keys = list(fno.keys())
+            print(f"⚠️ [{symbol}] nse_fno returned unexpected structure → keys = {keys}")
+        # If fno is None, we already printed the exception above
+        # Leave oi_pct_change at 0.0 and proceed
+    else:
+        try:
+            oi_list = fno["data"]
+            if not isinstance(oi_list, list) or len(oi_list) == 0:
+                print(f"⚠️ [{symbol}] fno['data'] is empty or not a list.")
+            else:
+                oi_today    = sum(item.get("openInterest", 0) for item in oi_list)
+                oi_prev_day = sum((item.get("openInterest", 0) - item.get("changeInOI", 0)) for item in oi_list)
+                if oi_prev_day > 0:
+                    oi_pct_change = ((oi_today - oi_prev_day) / oi_prev_day) * 100
+                else:
+                    oi_pct_change = 0.0
+        except Exception as e:
+            print(f"❌ [{symbol}] Error computing OI change: {e}")
+            oi_pct_change = 0.0
+
+    # Debug print of raw values (only if we made it this far)
     print(f"🔍 [{symbol}] pct_change={pct_change:.2f}% | industry='{industry}' | oi_pct_change={oi_pct_change:.2f}%")
 
     return {
@@ -126,13 +160,14 @@ def main():
         print("❌ No symbols to process. Exiting.")
         return
 
-    # 3) Step 2: Fetch quote + OI for each at 9:30
+    # 3) Step 2: Fetch quote + OI for each (around 9:30)
     print(f"⏱️ Starting fetch at {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} IST for {len(symbols)} symbols...\n")
     data = []
     for s in symbols:
         print(f"➡️ Fetching '{s}'...")
         info = fetch_quote_and_oi(s)
         if not info:
+            # Already logged the reason inside fetch_quote_and_oi
             continue
 
         # Filter 1: % change vs prev close ≥ PREMKT_THRESHOLD
@@ -143,7 +178,7 @@ def main():
             print(f"   ❎ [{s}] failed PREMKT_THRESHOLD ({info['pct_change']:.2f}% < {PREMKT_THRESHOLD:.2f}%)")
 
     if not data:
-        msg = f"⏳ No NIFTY stocks ≥ +{PREMKT_THRESHOLD:.1f}% at 09:30 on {datetime.date.today().isoformat()}."
+        msg = f"⏳ No stocks ≥ +{PREMKT_THRESHOLD:.1f}% at 09:30 on {datetime.date.today().isoformat()}."
         print("\n" + msg)
         send_telegram_message(msg)
         return
