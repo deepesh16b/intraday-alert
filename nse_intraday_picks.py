@@ -2,7 +2,7 @@ import pandas as pd
 import datetime
 import math
 import requests
-from nsepython import nse_eq, nse_fno
+from nsepy import get_quote, fut_chain_oi
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. CONFIGURATION
@@ -63,12 +63,12 @@ def send_telegram_message(text: str):
         print("⚠️ Failed to send Telegram message:", resp.text)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4. HELPERS FOR NSE DATA (with more checks)
+# 4. HELPERS FOR NSE DATA (using nsepy)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def fetch_quote_and_oi(symbol):
     """
-    Fetches from nsepython:
+    Fetches from nsepy:
       - LTP (last traded price)
       - Previous close
       - Industry/Sector
@@ -77,62 +77,27 @@ def fetch_quote_and_oi(symbol):
     Returns a dict { 'symbol', 'cmp', 'pct_change', 'industry', 'oi_pct_change' }
     or None if any error occurs.
     """
-    # 1) Equity quote via nse_eq(...)
+    # 1) Equity quote via get_quote(...)
     try:
-        q = nse_eq(symbol)
-    except Exception as e:
-        print(f"❌ [{symbol}] Exception calling nse_eq: {e}")
-        return None
-
-    # If "priceInfo" is missing, dump the top‐level keys and skip
-    if "priceInfo" not in q:
-        top_keys = list(q.keys())
-        snippet = {k: q.get(k) for k in top_keys[:3]}  # show first 3 keys
-        print(f"⚠️ [{symbol}] Unexpected response from nse_eq → top‐level keys = {top_keys}")
-        print(f"    Snippet of returned JSON (first 3 items): {snippet}\n")
-        return None
-
-    try:
-        cmp_price  = float(q["priceInfo"]["lastPrice"])
-        prev_close = float(q["priceInfo"]["close"])
+        q = get_quote(symbol)
+        cmp_price  = float(q['lastPrice'])
+        prev_close = float(q['previousClose'])
         pct_change = ((cmp_price - prev_close) / prev_close) * 100
-        industry   = q.get("metadata", {}).get("pdSectorInd", "Unknown")
+        industry   = q.get('industry', 'Unknown')
     except Exception as e:
-        print(f"❌ [{symbol}] Error parsing priceInfo/metadata: {e}")
+        print(f"❌ [{symbol}] Failed to fetch equity quote: {e}")
         return None
 
-    # 2) F&O chain via nse_fno(...)
-    oi_pct_change = 0.0
+    # 2) F&O chain via fut_chain_oi(...)
     try:
-        fno = nse_fno(symbol)
-    except Exception as e:
-        print(f"❌ [{symbol}] Exception calling nse_fno: {e}")
-        fno = None
+        chain_df, _ = fut_chain_oi(symbol)
+        oi_today       = chain_df['OI'].sum()
+        oi_prev_day    = chain_df['OI (Previous Day)'].sum()
+        oi_pct_change  = ((oi_today - oi_prev_day) / oi_prev_day) * 100 if oi_prev_day > 0 else 0.0
+    except Exception:
+        oi_pct_change = 0.0
 
-    if not fno or "data" not in fno:
-        # Either fno is None or missing "data"
-        if fno is not None:
-            keys = list(fno.keys())
-            print(f"⚠️ [{symbol}] nse_fno returned unexpected structure → keys = {keys}")
-        # If fno is None, we already printed the exception above
-        # Leave oi_pct_change at 0.0 and proceed
-    else:
-        try:
-            oi_list = fno["data"]
-            if not isinstance(oi_list, list) or len(oi_list) == 0:
-                print(f"⚠️ [{symbol}] fno['data'] is empty or not a list.")
-            else:
-                oi_today    = sum(item.get("openInterest", 0) for item in oi_list)
-                oi_prev_day = sum((item.get("openInterest", 0) - item.get("changeInOI", 0)) for item in oi_list)
-                if oi_prev_day > 0:
-                    oi_pct_change = ((oi_today - oi_prev_day) / oi_prev_day) * 100
-                else:
-                    oi_pct_change = 0.0
-        except Exception as e:
-            print(f"❌ [{symbol}] Error computing OI change: {e}")
-            oi_pct_change = 0.0
-
-    # Debug print of raw values (only if we made it this far)
+    # Debug print (optional)
     print(f"🔍 [{symbol}] pct_change={pct_change:.2f}% | industry='{industry}' | oi_pct_change={oi_pct_change:.2f}%")
 
     return {
@@ -144,7 +109,7 @@ def fetch_quote_and_oi(symbol):
     }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 5. MAIN SCRIPT (with debug prints)
+# 5. MAIN SCRIPT (with a little debug)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
@@ -167,7 +132,6 @@ def main():
         print(f"➡️ Fetching '{s}'...")
         info = fetch_quote_and_oi(s)
         if not info:
-            # Already logged the reason inside fetch_quote_and_oi
             continue
 
         # Filter 1: % change vs prev close ≥ PREMKT_THRESHOLD
