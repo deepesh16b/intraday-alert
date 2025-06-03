@@ -12,10 +12,10 @@ CAPITAL_TOTAL       = 50000        # (Reference only; not used directly)
 MARGIN_PER_TRADE    = 15000        # Margin allocated per stock
 LEVERAGE            = 2            # 2× intraday leverage
 MAX_SYMBOLS_PER_DAY = 3            # Pick up to 3 stocks per day
-PREMKT_THRESHOLD    = 0.3          # % change vs prev close (pre‐market + open move)
+PREMKT_THRESHOLD    = 2          # % change vs prev close (pre‐market + open move)
 SL_FACTOR           = 0.015        # Stop‐loss = 1.5% below entry
 TARGET_FACTOR       = 0.03         # Target₁ = 3% above entry
-SECTOR_MIN_COUNT    = 2            # Require ≥2 stocks in the same sector to trade
+SECTOR_MIN_COUNT    = 3            # Require ≥2 stocks in the same sector to trade
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 2. READ SYMBOL LIST
