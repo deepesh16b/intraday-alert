@@ -10,16 +10,18 @@ import yfinance as yf
 # 1. CONFIGURATION
 # ─────────────────────────────────────────────────────────────────────────────
 
-CAPITAL_TOTAL        = 50000        # (Reference only; not used directly)
-MARGIN_PER_TRADE     = 15000        # Margin allocated per stock
-LEVERAGE             = 2            # 2× intraday leverage
-MAX_SYMBOLS_PER_DAY  = 3            # Pick up to 3 stocks per day
-PREMKT_THRESHOLD     = 0.3          # % change vs prev close (pre‐market + open move)
-OI_THRESHOLD         = 7.0          # % increase in Futures OI to qualify
-SL_FACTOR            = 0.015        # Stop‐loss = 1.5% below entry
-TARGET_FACTOR        = 0.03         # Target₁ = 3% above entry
-SECTOR_MIN_COUNT     = 2            # Require ≥2 stocks in the same sector to trade
-SYMBOLS_FILE         = "symbols.txt"  # One ticker per line, e.g. RELIANCE, TCS, etc.
+CAPITAL_TOTAL        = 50000         # (Reference only; not used directly)
+MARGIN_PER_TRADE     = 15000         # Margin allocated per stock
+LEVERAGE             = 2             # 2× intraday leverage
+MAX_SYMBOLS_PER_DAY  = 3             # Pick up to 3 stocks per day
+
+PREMKT_THRESHOLD     = 2           # % change vs prev close at ~9:30
+VOL_SPIKE_THRESHOLD  = 200.0         # % spike: today’s 5-min vol ≥ (1 + 2.0)*avg_5min_volume = 3×
+SL_FACTOR            = 0.015         # Stop‐loss = 1.5% below entry
+TARGET_FACTOR        = 0.03          # Target₁ = 3% above entry
+SECTOR_MIN_COUNT     = 2             # Require ≥2 stocks in same sector to trade
+
+SYMBOLS_FILE         = "symbols.txt" # One ticker per line, e.g. RELIANCE, TCS, etc.
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 2. TELEGRAM BOT SETUP
@@ -59,87 +61,83 @@ def get_nifty_list():
         print(f"✔️ Loaded {len(symbols)} symbols from {SYMBOLS_FILE}\n")
         return symbols
     except FileNotFoundError:
-        print(f"⚠️ '{SYMBOLS_FILE}' not found. Please ensure the file exists in the script directory.")
+        print(f"⚠️ '{SYMBOLS_FILE}' not found. Please ensure the file exists.")
         return []
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4. FETCH QUOTE + OI (with NSE JSON scraping)
+# 4. FETCH SPOT + VOLUME-SPIKE DATA
 # ─────────────────────────────────────────────────────────────────────────────
 
-def fetch_quote_and_oi(symbol):
+def fetch_quote_and_vol_spike(symbol):
     """
-    1) Fetch spot data from yfinance: LTP, previous close, sector.
-    2) Attempt to fetch futures‐chain JSON from NSE to compute total OI % change.
-       If that fails, set 'oi_pct_change' = None.
-    Returns a dict { 'symbol', 'cmp', 'pct_change', 'sector', 'oi_pct_change' }
-    or None if spot quote fails.
+    1) Fetch spot data from yfinance: LTP, previous close, average daily volume, sector.
+    2) Fetch today's 1m bars from 09:30–09:35 to compute first-5-minute volume.
+    3) Compute:
+         pct_change = (LTP – prev_close)/prev_close × 100
+         avg_5min_vol ≈ averageVolume / 78   (approx 78 five-minute bars/day)
+         todays_5min_vol = sum of volume from 09:30–09:35
+         vol_spike_pct = (todays_5min_vol – avg_5min_vol)/avg_5min_vol × 100
+    Returns a dict:
+      {
+        'symbol':        symbol,
+        'cmp':           LTP,
+        'pct_change':    pct_change,
+        'sector':        sector,
+        'vol_spike_pct': vol_spike_pct  (or None if intraday fetch fails)
+      }
+    or None if spot fetch fails.
     """
-    # --- A) Fetch spot via yfinance ---
     yf_symbol = symbol + ".NS"
     try:
         t = yf.Ticker(yf_symbol)
         info = t.info
-        cmp_price   = float(info.get("regularMarketPrice", 0.0))
-        prev_close  = float(info.get("previousClose", 0.0))
-        sector      = info.get("sector", "Unknown") or "Unknown"
+        cmp_price     = float(info.get("regularMarketPrice", 0.0))
+        prev_close    = float(info.get("previousClose", 0.0))
+        avg_daily_vol = float(info.get("averageVolume", 0.0))
+        sector        = info.get("sector", "Unknown") or "Unknown"
     except Exception as e:
         print(f"❌ [{symbol}] yfinance error: {e}")
         return None
 
-    if prev_close == 0.0:
-        print(f"❌ [{symbol}] previousClose=0.0, skipping.")
+    if prev_close == 0.0 or avg_daily_vol == 0.0:
+        print(f"❌ [{symbol}] invalid prev_close or avg_daily_vol = 0, skipping.")
         return None
 
     pct_change = ((cmp_price - prev_close) / prev_close) * 100
 
-    # --- B) Fetch futures-chain JSON from NSE (scraping) ---
-    oi_pct_change = None  # default if fetch fails
-    base_url = f"https://www.nseindia.com/api/future-chain-equity?symbol={symbol}"
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/114.0.0.0 Safari/537.36"
-        ),
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://www.nseindia.com/option-chain",
-        "Origin": "https://www.nseindia.com"
-    }
+    # Calculate approximate average 5-min volume
+    # (there are ~78 five-minute bars in a 6.5-hour trading day)
+    avg_5min_vol = avg_daily_vol / 78.0
 
-    session = requests.Session()
-    session.headers.update(headers)
+    # Now fetch today’s intraday 1m data from 09:30 to 09:35
+    vol_spike_pct = None
+    start_dt = datetime.datetime.combine(datetime.date.today(), datetime.time(9, 30))
+    end_dt   = start_dt + datetime.timedelta(minutes=5)
 
-    # Step 1: hit homepage to get cookies
     try:
-        session.get("https://www.nseindia.com", timeout=5)
-    except Exception as e:
-        print(f"⚠️ [{symbol}] NSE homepage request failed: {e}")
-
-    # Step 2: request futures‐chain JSON
-    try:
-        resp = session.get(base_url, timeout=5)
-        resp.raise_for_status()
-        data = resp.json()
-        records = data.get("records", {}).get("data", [])
-        if isinstance(records, list) and len(records) > 0:
-            oi_today = sum(item.get("openInterest", 0) for item in records)
-            oi_prev_day = sum(item.get("openInterestPrevDay", 0) for item in records)
-            if oi_prev_day > 0:
-                oi_pct_change = ((oi_today - oi_prev_day) / oi_prev_day) * 100
-            else:
-                oi_pct_change = 0.0
+        hist = t.history(
+            start=start_dt.strftime("%Y-%m-%d %H:%M:%S"),
+            end=end_dt.strftime("%Y-%m-%d %H:%M:%S"),
+            interval="1m",
+            actions=False
+        )
+        # If history is empty or missing Volume column, treat as failure
+        if "Volume" in hist.columns and not hist.empty:
+            today_5min_vol = int(hist["Volume"].sum())
+            # Compute % spike
+            vol_spike_pct = ((today_5min_vol - avg_5min_vol) / avg_5min_vol) * 100
         else:
-            print(f"⚠️ [{symbol}] No records in futures‐chain JSON.")
-            oi_pct_change = None
+            print(f"⚠️ [{symbol}] No intraday volume data from yfinance.")
+            vol_spike_pct = None
     except Exception as e:
-        print(f"❌ [{symbol}] Failed to fetch/parsing futures‐chain JSON: {e}")
-        oi_pct_change = None
+        print(f"❌ [{symbol}] Intraday fetch failed: {e}")
+        vol_spike_pct = None
 
     # Debug print
-    oi_text = f"{oi_pct_change:.2f}%" if oi_pct_change is not None else "N/A"
+    vs_text = f"{vol_spike_pct:.2f}%" if vol_spike_pct is not None else "N/A"
     print(
-        f"🔍 [{symbol}] spot_pct={pct_change:.2f}% | sector='{sector}' | OI Δ = {oi_text}"
+        f"🔍 [{symbol}] spot_pct={pct_change:.2f}% | sector='{sector}' | "
+        f"5minVolSpike={vs_text}"
     )
 
     return {
@@ -147,7 +145,7 @@ def fetch_quote_and_oi(symbol):
         "cmp":           cmp_price,
         "pct_change":    pct_change,
         "sector":        sector,
-        "oi_pct_change": oi_pct_change
+        "vol_spike_pct": vol_spike_pct
     }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -170,10 +168,10 @@ def main():
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"⏱️ Starting fetch at {now} IST for {len(symbols)} symbols...\n")
 
-    data_rows = []
+    rows = []
     for s in symbols:
         print(f"➡️ Fetching '{s}'…")
-        info = fetch_quote_and_oi(s)
+        info = fetch_quote_and_vol_spike(s)
         if not info:
             continue
 
@@ -182,34 +180,40 @@ def main():
             print(f"   ❎ [{s}] spot_pct {info['pct_change']:.2f}% < {PREMKT_THRESHOLD:.2f}%")
             continue
 
-        # Keep the row regardless of OI fetch; OI filter will apply later
-        data_rows.append(info)
+        # Filter B: 5min volume-spike ≥ VOL_SPIKE_THRESHOLD
+        # If vol_spike_pct is None (intraday fetch failed), we treat it as “did not pass” for now.
+        if info["vol_spike_pct"] is None or info["vol_spike_pct"] < VOL_SPIKE_THRESHOLD:
+            vs = info["vol_spike_pct"]
+            vs_txt = f"{vs:.2f}%" if vs is not None else "N/A"
+            print(f"   ❎ [{s}] 5minVolSpike {vs_txt} < {VOL_SPIKE_THRESHOLD:.2f}%")
+            continue
 
-        # To reduce chances of 429/403, add a short sleep
+        # Symbol passed both filters
+        rows.append(info)
+        # Short sleep to avoid yfinance rate‐limit issues
         time.sleep(0.5)
 
-    if not data_rows:
-        msg = f"⏳ No stocks ≥ +{PREMKT_THRESHOLD:.1f}% at 09:30 on {datetime.date.today().isoformat()}."
+    if not rows:
+        msg = f"⏳ No stocks ≥ +{PREMKT_THRESHOLD:.1f}% & vol_spike ≥ {VOL_SPIKE_THRESHOLD:.1f}% at 09:30 on {datetime.date.today().isoformat()}."
         print("\n" + msg)
         send_telegram_message(msg)
         return
 
-    df = pd.DataFrame(data_rows)
-    print(f"\n📊 {len(df)} symbols passed spot filter. Details:")
-    print(df[["symbol", "pct_change", "sector", "oi_pct_change"]].to_string(index=False))
+    df = pd.DataFrame(rows)
+    print(f"\n📊 {len(df)} symbols passed both filters. Details:")
+    print(df[["symbol", "pct_change", "sector", "vol_spike_pct"]].to_string(index=False))
     print()
 
-    # 4) Momentum‐sector filter (among those passing spot filter)
+    # 4) Momentum‐sector filter
     sector_counts = df["sector"].value_counts()
     print("📈 Sector counts among filtered symbols:")
     for sector, count in sector_counts.items():
         print(f"   • {sector}: {count} stock(s)")
 
-    # Keep sectors with at least SECTOR_MIN_COUNT
     momentum_sectors = sector_counts[sector_counts >= SECTOR_MIN_COUNT].index.tolist()
     if not momentum_sectors:
         msg = (
-            f"⚠️ No sector has ≥ {SECTOR_MIN_COUNT} stocks with +{PREMKT_THRESHOLD:.1f}% at 09:30.\n"
+            f"⚠️ No sector has ≥ {SECTOR_MIN_COUNT} stocks meeting both filters at 09:30.\n"
             f"Date: {datetime.date.today().isoformat()}"
         )
         print("\n" + msg)
@@ -228,66 +232,32 @@ def main():
 
     print(f"   → {len(df_sector)} stocks remain in '{chosen_sector}': {df_sector['symbol'].tolist()}\n")
 
-    # 5) Within that sector, apply OI filter if available
-    # Split into those with valid OI and those where OI fetch failed
-    df_valid_oi = df_sector[df_sector["oi_pct_change"].notnull()].copy()
-    df_no_oi    = df_sector[df_sector["oi_pct_change"].isnull()].copy()
+    # 5) Sort by spot % change and pick top MAX_SYMBOLS_PER_DAY
+    df_sector = df_sector.sort_values(by="pct_change", ascending=False).head(MAX_SYMBOLS_PER_DAY)
+    print(f"🏆 Top {MAX_SYMBOLS_PER_DAY} picks by %‐change:")
+    print(df_sector[["symbol", "pct_change", "vol_spike_pct"]].to_string(index=False), "\n")
 
-    # Among valid OI, keep those ≥ OI_THRESHOLD
-    df_valid_oi = df_valid_oi[df_valid_oi["oi_pct_change"] >= OI_THRESHOLD].copy()
-
-    picks = []
-    note_oi_failed = False
-
-    if not df_valid_oi.empty:
-        # Sort by spot % change and pick top
-        df_valid_oi = df_valid_oi.sort_values(by="pct_change", ascending=False)
-        picks = df_valid_oi.head(MAX_SYMBOLS_PER_DAY).to_dict("records")
-
-        # If fewer than MAX_SYMBOLS_PER_DAY, fill from df_no_oi (order by spot %)
-        if len(picks) < MAX_SYMBOLS_PER_DAY and not df_no_oi.empty:
-            df_no_oi = df_no_oi.sort_values(by="pct_change", ascending=False)
-            needed = MAX_SYMBOLS_PER_DAY - len(picks)
-            for _, row in df_no_oi.head(needed).iterrows():
-                picks.append(row.to_dict())
-                note_oi_failed = True
-    else:
-        # No valid OI‐filtered picks; use those where OI fetch failed (if any)
-        if not df_no_oi.empty:
-            df_no_oi = df_no_oi.sort_values(by="pct_change", ascending=False)
-            picks = df_no_oi.head(MAX_SYMBOLS_PER_DAY).to_dict("records")
-            note_oi_failed = True
-        else:
-            # No picks at all
-            msg = (
-                f"⚠️ No stocks in sector '{chosen_sector}' have OI Δ ≥ {OI_THRESHOLD:.1f}% "
-                f"and OI fetch succeeded at 09:30.\nDate: {datetime.date.today().isoformat()}"
-            )
-            print("\n" + msg)
-            send_telegram_message(msg)
-            return
-
-    # 6) Build Telegram message
+    # 6) Build Telegram message (plain text)
     header = (
         "🟢 9:30 Intraday Picks for {}\n"
         "Sector in focus: {}\n\n"
     ).format(datetime.date.today().isoformat(), chosen_sector)
 
     lines = []
-    for info in picks:
-        sym        = info["symbol"]
-        cmp_p      = info["cmp"]
-        sl         = round(cmp_p * (1 - SL_FACTOR), 2)
-        tgt        = round(cmp_p * (1 + TARGET_FACTOR), 2)
-        qty        = math.floor((MARGIN_PER_TRADE * LEVERAGE) / cmp_p)
-        oi_pct     = info["oi_pct_change"]
-        oi_display = f"{oi_pct:.2f}%" if oi_pct is not None else "N/A"
+    for _, row in df_sector.iterrows():
+        sym         = row["symbol"]
+        cmp_p       = row["cmp"]
+        sl          = round(cmp_p * (1 - SL_FACTOR), 2)
+        tgt         = round(cmp_p * (1 + TARGET_FACTOR), 2)
+        qty         = math.floor((MARGIN_PER_TRADE * LEVERAGE) / cmp_p)
+        vs_pct      = row["vol_spike_pct"]
+        vs_display  = f"{vs_pct:.2f}%"
 
         block = (
             f"🔹 {sym}\n"
             f"   Entry: {cmp_p:.2f}\n"
             f"   SL: {sl:.2f}  |  Target₁: {tgt:.2f}\n"
-            f"   OI Δ: {oi_display}\n"
+            f"   5m Vol-Spike: {vs_display}\n"
             f"   Qty (@2× Lev): {qty}\n"
             f"   • At +1.5% → move SL → {cmp_p:.2f}\n"
             f"   • At +2% → trail SL = (current_price × 0.99)\n"
@@ -296,14 +266,12 @@ def main():
 
     footer = (
         "\n⚠️ Remember:\n"
-        " • Place a Bracket‐Order if your broker supports it (Groww, AngelOne, Dhan).\n"
+        " • Place a Bracket-Order if your broker supports it (Groww, AngelOne, Dhan).\n"
         " • If no BO, place market/limit buy → set SL at the SL level.\n"
         " • Move SL to breakeven at +1.5%; trail SL by –1% once +2% hits.\n"
         " • Exit all positions by 10:30 AM IST if neither SL nor target is hit.\n"
         " • Stop trading for the day if you lose 2 full SLs (~₹1,500–₹2,000).\n"
     )
-    if note_oi_failed:
-        footer += "⚠️ OI fetch failed for some picks; OI filter was not applied to them.\n"
 
     full_message = header + "\n".join(lines) + footer
 
