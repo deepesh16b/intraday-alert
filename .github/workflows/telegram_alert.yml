@@ -20,7 +20,7 @@ jobs:
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pandas nsepython requests
+          pip install pandas nsepy requests
 
       - name: Run Intraday Picks Script
         env:
