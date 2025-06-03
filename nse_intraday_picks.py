@@ -2,7 +2,7 @@ import pandas as pd
 import datetime
 import math
 import requests
-from nsetools import Nse
+import yfinance as yf
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. CONFIGURATION
@@ -13,8 +13,6 @@ MARGIN_PER_TRADE    = 15000        # Margin allocated per stock
 LEVERAGE            = 2            # 2× intraday leverage
 MAX_SYMBOLS_PER_DAY = 3            # Pick up to 3 stocks per day
 PREMKT_THRESHOLD    = 0.3          # % change vs prev close (pre-market + open move)
-# (Since we dropped OI, set OI_THRESHOLD to 0, but we’ll not even check it below)
-OI_THRESHOLD        = 0.0
 SL_FACTOR           = 0.015        # Stop-loss = 1.5% below entry
 TARGET_FACTOR       = 0.03         # Target₁ = 3% above entry
 SECTOR_MIN_COUNT    = 2            # Require ≥2 stocks in the same sector to trade
@@ -26,6 +24,7 @@ SECTOR_MIN_COUNT    = 2            # Require ≥2 stocks in the same sector to t
 def get_nifty_list():
     """
     Reads stock symbols from 'symbols.txt' and returns them as a list.
+    (Assumes each line in symbols.txt is a valid NSE ticker like RELIANCE, TCS, etc.)
     """
     try:
         with open("symbols.txt", "r") as file:
@@ -64,46 +63,45 @@ def send_telegram_message(text: str):
         print("⚠️ Failed to send Telegram message:", resp.text)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4. HELPERS FOR NSE DATA (via nsetools)
+# 4. HELPERS FOR FINANCIAL DATA (via yfinance)
 # ─────────────────────────────────────────────────────────────────────────────
-
-nse = Nse()
 
 def fetch_quote(symbol):
     """
-    Fetches from nsetools:
-      - last traded price (LTP)
-      - previous close
-      - industry/sector
+    Uses yfinance to fetch:
+      - last traded price ("regularMarketPrice")
+      - previous close ("previousClose")
+      - sector ("sector")
 
-    Returns a dict { 'symbol', 'cmp', 'pct_change', 'industry' }
+    Returns a dict { 'symbol', 'cmp', 'pct_change', 'sector' }
     or None if any error occurs.
     """
+    yf_symbol = symbol + ".NS"  # Append .NS for NSE tickers in yfinance
     try:
-        q = nse.get_quote(symbol)
-        # 'lastPrice' and 'previousClose' come as strings or floats
-        cmp_price  = float(q.get("lastPrice", 0.0))
-        prev_close = float(q.get("previousClose", 0.0))
-        if prev_close == 0.0:
-            # no valid data
-            print(f"❌ [{symbol}] invalid prev_close=0.0, skipping.")
-            return None
-
-        pct_change = ((cmp_price - prev_close) / prev_close) * 100
-        industry   = q.get("industry", "Unknown") or "Unknown"
-
+        t = yf.Ticker(yf_symbol)
+        info = t.info
+        cmp_price   = float(info.get("regularMarketPrice", 0.0))
+        prev_close  = float(info.get("previousClose", 0.0))
+        sector      = info.get("sector", "Unknown") or "Unknown"
     except Exception as e:
-        print(f"❌ [{symbol}] Failed to fetch quote via nsetools: {e}")
+        print(f"❌ [{symbol}] Failed to fetch via yfinance: {e}")
         return None
 
+    if prev_close == 0.0:
+        # Invalid or no data returned
+        print(f"❌ [{symbol}] previousClose=0.0, skipping.")
+        return None
+
+    pct_change = ((cmp_price - prev_close) / prev_close) * 100
+
     # Debug print
-    print(f"🔍 [{symbol}] cmp={cmp_price:.2f} | prev_close={prev_close:.2f} | pct_change={pct_change:.2f}% | industry='{industry}'")
+    print(f"🔍 [{symbol}] cmp={cmp_price:.2f} | prev_close={prev_close:.2f} | pct_change={pct_change:.2f}% | sector='{sector}'")
 
     return {
         "symbol":     symbol,
         "cmp":        cmp_price,
         "pct_change": pct_change,
-        "industry":   industry
+        "sector":     sector
     }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -123,7 +121,7 @@ def main():
         print("❌ No symbols to process. Exiting.")
         return
 
-    # 3) Step 2: Fetch quote for each at ~9:30
+    # 3) Step 2: Fetch quote for each (around 9:30 AM IST)
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"⏱️ Starting fetch at {now} IST for {len(symbols)} symbols...\n")
 
@@ -147,13 +145,14 @@ def main():
         send_telegram_message(msg)
         return
 
+    # Build DataFrame of filtered stocks
     df = pd.DataFrame(data)
     print(f"\n📊 {len(df)} symbols passed the 1st filter. Details:")
-    print(df[["symbol", "pct_change", "industry"]].to_string(index=False))
+    print(df[["symbol", "pct_change", "sector"]].to_string(index=False))
     print()
 
-    # 4) Step 3: “Momentum sector” filter (≥ SECTOR_MIN_COUNT winners in same industry)
-    sector_counts = df["industry"].value_counts()
+    # 4) Step 3: “Momentum sector” filter (≥ SECTOR_MIN_COUNT winners in same sector)
+    sector_counts = df["sector"].value_counts()
     print("📈 Sector counts among filtered symbols:")
     for sector, count in sector_counts.items():
         print(f"   • {sector}: {count} stock(s)")
@@ -172,7 +171,7 @@ def main():
     chosen_sector = sector_counts.idxmax()
     print(f"\n🎯 Chosen sector: {chosen_sector} ({sector_counts[chosen_sector]} winners)")
 
-    df = df[df["industry"] == chosen_sector].copy()
+    df = df[df["sector"] == chosen_sector].copy()
     if df.empty:
         msg = f"⚠️ After sector filter, 0 stocks remain in {chosen_sector}."
         print("\n" + msg)
@@ -181,7 +180,7 @@ def main():
 
     print(f"   → {len(df)} stocks remain after selecting sector '{chosen_sector}': {df['symbol'].tolist()}\n")
 
-    # 5) (No OI filter) → Move on to sorting & final picks
+    # 5) Step 4: (No OI filter in this version) → Sort by pct_change and pick top N
     df = df.sort_values(by="pct_change", ascending=False).head(MAX_SYMBOLS_PER_DAY)
     print(f"🏆 Top {MAX_SYMBOLS_PER_DAY} picks by %‐change:")
     print(df[["symbol", "pct_change"]].to_string(index=False), "\n")
