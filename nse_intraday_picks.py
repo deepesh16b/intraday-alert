@@ -12,8 +12,8 @@ CAPITAL_TOTAL       = 50000        # (Reference only; not used directly)
 MARGIN_PER_TRADE    = 15000        # Margin allocated per stock
 LEVERAGE            = 2            # 2× intraday leverage
 MAX_SYMBOLS_PER_DAY = 3            # Pick up to 3 stocks per day
-PREMKT_THRESHOLD    = 0.3          # % change vs prev close (pre-market + open move)
-SL_FACTOR           = 0.015        # Stop-loss = 1.5% below entry
+PREMKT_THRESHOLD    = 0.3          # % change vs prev close (pre‐market + open move)
+SL_FACTOR           = 0.015        # Stop‐loss = 1.5% below entry
 TARGET_FACTOR       = 0.03         # Target₁ = 3% above entry
 SECTOR_MIN_COUNT    = 2            # Require ≥2 stocks in the same sector to trade
 
@@ -45,6 +45,7 @@ TELEGRAM_CHAT_ID   = None
 def send_telegram_message(text: str):
     """
     Sends `text` to the Telegram chat using BOT_TOKEN and CHAT_ID.
+    (Now sends as plain text to avoid Markdown‐parsing issues.)
     Raises if either secret is not set.
     """
     global TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
@@ -55,8 +56,7 @@ def send_telegram_message(text: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
-        "parse_mode": "Markdown"
+        "text": text  # plain text (no parse_mode)
     }
     resp = requests.post(url, data=payload)
     if not resp.ok:
@@ -180,14 +180,16 @@ def main():
 
     print(f"   → {len(df)} stocks remain after selecting sector '{chosen_sector}': {df['symbol'].tolist()}\n")
 
-    # 5) Step 4: (No OI filter in this version) → Sort by pct_change and pick top N
+    # 5) Step 4: Sort by pct_change and pick top MAX_SYMBOLS_PER_DAY
     df = df.sort_values(by="pct_change", ascending=False).head(MAX_SYMBOLS_PER_DAY)
     print(f"🏆 Top {MAX_SYMBOLS_PER_DAY} picks by %‐change:")
     print(df[["symbol", "pct_change"]].to_string(index=False), "\n")
 
-    # 6) Build the Telegram message
-    header = f"🟢 *9:30 Intraday Picks for {datetime.date.today().isoformat()}*\n"
-    header += f"Sector in focus: *{chosen_sector}*\n\n"
+    # 6) Build the Telegram message (plain text)
+    header = (
+        "🟢 9:30 Intraday Picks for {}\n"
+        "Sector in focus: {}\n\n"
+    ).format(datetime.date.today().isoformat(), chosen_sector)
 
     lines = []
     for _, row in df.iterrows():
@@ -197,25 +199,23 @@ def main():
         tgt   = round(cmp_p * (1 + TARGET_FACTOR), 2)
         qty   = math.floor((MARGIN_PER_TRADE * LEVERAGE) / cmp_p)
 
-        trail_instr = (
-            f"• At +1.5% → move SL → *{cmp_p:.2f}*\n"
-            f"• At +2% → trail SL = (current_price × 0.99)"
+        # Plain‐text instructions, no asterisks
+        block = (
+            f"🔹 {sym}\n"
+            f"   Entry: {cmp_p:.2f}\n"
+            f"   SL: {sl:.2f}  |  Target₁: {tgt:.2f}\n"
+            f"   Qty (@2× Lev): {qty}\n"
+            f"   • At +1.5% → move SL → {cmp_p:.2f}\n"
+            f"   • At +2% → trail SL = (current_price × 0.99)\n"
         )
-
-        lines.append(
-            f"🔹 *{sym}*  \n"
-            f"   Entry: *{cmp_p:.2f}*  \n"
-            f"   SL: *{sl:.2f}*  |  Target₁: *{tgt:.2f}*  \n"
-            f"   Qty (@2× Lev): *{qty}*  \n"
-            f"{trail_instr}\n"
-        )
+        lines.append(block)
 
     footer = (
-        "\n⚠️ *Remember:*  \n"
-        " • Place a *Bracket‐Order* if your broker supports it (Groww, AngelOne, Dhan).  \n"
-        " • If no BO, place market/limit buy → set SL at above SL.  \n"
-        " • Move SL to breakeven at +1.5%; trail SL by –1% once +2% hits.  \n"
-        " • *Exit all positions by 10:30 AM* IST if neither SL nor target is hit.  \n"
+        "\n⚠️ Remember:\n"
+        " • Place a Bracket‐Order if your broker supports it (Groww, AngelOne, Dhan).\n"
+        " • If no BO, place market/limit buy → set SL at the SL level.\n"
+        " • Move SL to breakeven at +1.5%; trail SL by –1% once +2% hits.\n"
+        " • Exit all positions by 10:30 AM IST if neither SL nor target is hit.\n"
         " • Stop trading for the day if you lose 2 full SLs (~₹1,500–₹2,000)."
     )
 
