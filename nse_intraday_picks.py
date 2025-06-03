@@ -15,8 +15,9 @@ MARGIN_PER_TRADE     = 15000         # Margin allocated per stock
 LEVERAGE             = 2             # 2× intraday leverage
 MAX_SYMBOLS_PER_DAY  = 3             # Pick up to 3 stocks per day
 
-PREMKT_THRESHOLD     = 2           # % change vs prev close at ~9:30
-VOL_SPIKE_THRESHOLD  = 200.0         # % spike: today’s 5-min vol ≥ (1 + 2.0)*avg_5min_volume = 3×
+# Use 2% open‐move threshold as per expert guidance
+PREMKT_THRESHOLD     = 2.0           # % change vs prev close at ~9:30
+VOL_SPIKE_THRESHOLD  = 200.0         # % spike: today’s 5-min vol ≥ (1 + 2.0)×avg_5min_volume = 3×
 SL_FACTOR            = 0.015         # Stop‐loss = 1.5% below entry
 TARGET_FACTOR        = 0.03          # Target₁ = 3% above entry
 SECTOR_MIN_COUNT     = 2             # Require ≥2 stocks in same sector to trade
@@ -71,12 +72,12 @@ def get_nifty_list():
 def fetch_quote_and_vol_spike(symbol):
     """
     1) Fetch spot data from yfinance: LTP, previous close, average daily volume, sector.
-    2) Fetch today's 1m bars from 09:30–09:35 to compute first-5-minute volume.
+    2) Fetch today's 1m bars (period='1d', interval='1m'), convert to IST, and sum volume from 09:30–09:35.
     3) Compute:
          pct_change = (LTP – prev_close)/prev_close × 100
          avg_5min_vol ≈ averageVolume / 78   (approx 78 five-minute bars/day)
-         todays_5min_vol = sum of volume from 09:30–09:35
-         vol_spike_pct = (todays_5min_vol – avg_5min_vol)/avg_5min_vol × 100
+         today_5min_vol = sum of volume from 09:30–09:35 IST
+         vol_spike_pct = (today_5min_vol – avg_5min_vol)/avg_5min_vol × 100
     Returns a dict:
       {
         'symbol':        symbol,
@@ -105,30 +106,33 @@ def fetch_quote_and_vol_spike(symbol):
 
     pct_change = ((cmp_price - prev_close) / prev_close) * 100
 
-    # Calculate approximate average 5-min volume
-    # (there are ~78 five-minute bars in a 6.5-hour trading day)
+    # Calculate approximate average 5-minute volume (78 bars per 6.5-hour day)
     avg_5min_vol = avg_daily_vol / 78.0
 
-    # Now fetch today’s intraday 1m data from 09:30 to 09:35
+    # Fetch today's intraday 1m history (full day)
     vol_spike_pct = None
-    start_dt = datetime.datetime.combine(datetime.date.today(), datetime.time(9, 30))
-    end_dt   = start_dt + datetime.timedelta(minutes=5)
-
     try:
-        hist = t.history(
-            start=start_dt.strftime("%Y-%m-%d %H:%M:%S"),
-            end=end_dt.strftime("%Y-%m-%d %H:%M:%S"),
-            interval="1m",
-            actions=False
-        )
-        # If history is empty or missing Volume column, treat as failure
-        if "Volume" in hist.columns and not hist.empty:
-            today_5min_vol = int(hist["Volume"].sum())
-            # Compute % spike
-            vol_spike_pct = ((today_5min_vol - avg_5min_vol) / avg_5min_vol) * 100
-        else:
-            print(f"⚠️ [{symbol}] No intraday volume data from yfinance.")
+        hist = t.history(period="1d", interval="1m", actions=False)
+        if hist.empty or "Volume" not in hist.columns:
+            print(f"⚠️ [{symbol}] No intraday data returned by yfinance.")
             vol_spike_pct = None
+        else:
+            # Convert index to Asia/Kolkata timezone
+            hist = hist.tz_convert("Asia/Kolkata")
+
+            # Filter between 09:30 and 09:35 (inclusive of 09:30, exclusive of 09:35)
+            start_time = datetime.time(9, 30)
+            end_time   = datetime.time(9, 35)
+            mask = hist.index.time >= start_time
+            mask &= hist.index.time < end_time
+            first_5min = hist.loc[mask]
+
+            if not first_5min.empty:
+                today_5min_vol = int(first_5min["Volume"].sum())
+                vol_spike_pct = ((today_5min_vol - avg_5min_vol) / avg_5min_vol) * 100
+            else:
+                print(f"⚠️ [{symbol}] No bars between 09:30–09:35 IST.")
+                vol_spike_pct = None
     except Exception as e:
         print(f"❌ [{symbol}] Intraday fetch failed: {e}")
         vol_spike_pct = None
@@ -136,8 +140,7 @@ def fetch_quote_and_vol_spike(symbol):
     # Debug print
     vs_text = f"{vol_spike_pct:.2f}%" if vol_spike_pct is not None else "N/A"
     print(
-        f"🔍 [{symbol}] spot_pct={pct_change:.2f}% | sector='{sector}' | "
-        f"5minVolSpike={vs_text}"
+        f"🔍 [{symbol}] spot_pct={pct_change:.2f}% | sector='{sector}' | 5m Vol-Spike={vs_text}"
     )
 
     return {
@@ -180,21 +183,23 @@ def main():
             print(f"   ❎ [{s}] spot_pct {info['pct_change']:.2f}% < {PREMKT_THRESHOLD:.2f}%")
             continue
 
-        # Filter B: 5min volume-spike ≥ VOL_SPIKE_THRESHOLD
-        # If vol_spike_pct is None (intraday fetch failed), we treat it as “did not pass” for now.
+        # Filter B: 5-minute volume spike ≥ VOL_SPIKE_THRESHOLD
         if info["vol_spike_pct"] is None or info["vol_spike_pct"] < VOL_SPIKE_THRESHOLD:
             vs = info["vol_spike_pct"]
             vs_txt = f"{vs:.2f}%" if vs is not None else "N/A"
-            print(f"   ❎ [{s}] 5minVolSpike {vs_txt} < {VOL_SPIKE_THRESHOLD:.2f}%")
+            print(f"   ❎ [{s}] 5m Vol-Spike {vs_txt} < {VOL_SPIKE_THRESHOLD:.2f}%")
             continue
 
-        # Symbol passed both filters
+        # Passed both filters
         rows.append(info)
-        # Short sleep to avoid yfinance rate‐limit issues
+        # Short sleep to avoid yfinance rate-limit issues
         time.sleep(0.5)
 
     if not rows:
-        msg = f"⏳ No stocks ≥ +{PREMKT_THRESHOLD:.1f}% & vol_spike ≥ {VOL_SPIKE_THRESHOLD:.1f}% at 09:30 on {datetime.date.today().isoformat()}."
+        msg = (
+            f"⏳ No stocks ≥ +{PREMKT_THRESHOLD:.1f}% & 5m Vol-Spike ≥ {VOL_SPIKE_THRESHOLD:.1f}% "
+            f"at 09:30 on {datetime.date.today().isoformat()}."
+        )
         print("\n" + msg)
         send_telegram_message(msg)
         return
@@ -204,7 +209,7 @@ def main():
     print(df[["symbol", "pct_change", "sector", "vol_spike_pct"]].to_string(index=False))
     print()
 
-    # 4) Momentum‐sector filter
+    # 4) Momentum-sector filter
     sector_counts = df["sector"].value_counts()
     print("📈 Sector counts among filtered symbols:")
     for sector, count in sector_counts.items():
@@ -234,7 +239,7 @@ def main():
 
     # 5) Sort by spot % change and pick top MAX_SYMBOLS_PER_DAY
     df_sector = df_sector.sort_values(by="pct_change", ascending=False).head(MAX_SYMBOLS_PER_DAY)
-    print(f"🏆 Top {MAX_SYMBOLS_PER_DAY} picks by %‐change:")
+    print(f"🏆 Top {MAX_SYMBOLS_PER_DAY} picks by %-change:")
     print(df_sector[["symbol", "pct_change", "vol_spike_pct"]].to_string(index=False), "\n")
 
     # 6) Build Telegram message (plain text)
