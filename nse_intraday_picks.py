@@ -12,8 +12,8 @@ CAPITAL_TOTAL       = 50000        # (Reference only; not used directly)
 MARGIN_PER_TRADE    = 15000        # Margin allocated per stock
 LEVERAGE            = 2            # 2× intraday leverage
 MAX_SYMBOLS_PER_DAY = 3            # Pick up to 3 stocks per day
-PREMKT_THRESHOLD    = 2.0          # % change vs prev close (pre-market + open move)
-OI_THRESHOLD        = 7.0          # % increase in Futures OI to qualify
+PREMKT_THRESHOLD    = 1.0          # % change vs prev close (pre-market + open move)
+OI_THRESHOLD        = 4.0          # % increase in Futures OI to qualify
 SL_FACTOR           = 0.015        # Stop-loss = 1.5% below entry
 TARGET_FACTOR       = 0.03         # Target₁ = 3% above entry
 SECTOR_MIN_COUNT    = 3            # Require ≥3 stocks in the same sector to trade
