@@ -16,12 +16,11 @@ PREMKT_THRESHOLD    = 0.3          # % change vs prev close (pre-market + open m
 OI_THRESHOLD        = 2.0          # % increase in Futures OI to qualify
 SL_FACTOR           = 0.015        # Stop-loss = 1.5% below entry
 TARGET_FACTOR       = 0.03         # Target₁ = 3% above entry
-SECTOR_MIN_COUNT    = 2          # Require ≥3 stocks in the same sector to trade
+SECTOR_MIN_COUNT    = 2            # Require ≥2 stocks in the same sector to trade
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 2. HARD-CODED NIFTY 200 LIST
+# 2. READ SYMBOL LIST
 # ─────────────────────────────────────────────────────────────────────────────
-
 
 def get_nifty_list():
     """
@@ -30,11 +29,11 @@ def get_nifty_list():
     try:
         with open("symbols.txt", "r") as file:
             symbols = [line.strip().upper() for line in file if line.strip()]
+        print(f"✔️ Loaded {len(symbols)} symbols from symbols.txt\n")
         return symbols
     except FileNotFoundError:
         print("⚠️ 'symbols.txt' not found. Please ensure the file exists in the script directory.")
         return []
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 3. TELEGRAM BOT SETUP
@@ -64,10 +63,8 @@ def send_telegram_message(text: str):
         print("⚠️ Failed to send Telegram message:", resp.text)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4. HELPERS FOR NSE DATA
+# 4. HELPERS FOR NSE DATA (with debug prints)
 # ─────────────────────────────────────────────────────────────────────────────
-
-
 
 def fetch_quote_and_oi(symbol):
     """
@@ -87,18 +84,22 @@ def fetch_quote_and_oi(symbol):
         prev_close = float(q["priceInfo"]["close"])
         pct_change = ((cmp_price - prev_close) / prev_close) * 100
         industry   = q["metadata"].get("pdSectorInd", "Unknown")
-    except Exception:
+    except Exception as e:
+        print(f"❌ [{symbol}] Failed to fetch equity quote: {e}")
         return None
 
-    # 2) F&O‐chain via nse_fno(...)
+    # 2) F&O chain via nse_fno(...)
     try:
         fno = nse_fno(symbol)
-        # Sum up "openInterest" for today vs yesterday
         oi_today    = sum(item.get("openInterest", 0) for item in fno["data"])
         oi_prev_day = sum((item.get("openInterest", 0) - item.get("changeInOI", 0)) for item in fno["data"])
         oi_pct_change = ((oi_today - oi_prev_day) / oi_prev_day) * 100 if oi_prev_day > 0 else 0.0
-    except Exception:
-        oi_pct_change = 0.0
+    except Exception as e:
+        print(f"❌ [{symbol}] Failed to fetch F&O chain or compute OI: {e}")
+        oi_pct_change = 0.0  # still return the quote data, but OI change is zero
+
+    # Debug print of raw values
+    print(f"🔍 [{symbol}] pct_change={pct_change:.2f}% | industry='{industry}' | oi_pct_change={oi_pct_change:.2f}%")
 
     return {
         "symbol":        symbol,
@@ -109,7 +110,7 @@ def fetch_quote_and_oi(symbol):
     }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 5. MAIN SCRIPT
+# 5. MAIN SCRIPT (with debug prints)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
@@ -119,57 +120,90 @@ def main():
     TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
     TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
 
-    # 2) Step 1: Use our NIFTY 200 list
+    # 2) Step 1: Use our symbol list
     symbols = get_nifty_list()
+    if not symbols:
+        print("❌ No symbols to process. Exiting.")
+        return
 
     # 3) Step 2: Fetch quote + OI for each at 9:30
+    print(f"⏱️ Starting fetch at {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} IST for {len(symbols)} symbols...\n")
     data = []
     for s in symbols:
+        print(f"➡️ Fetching '{s}'...")
         info = fetch_quote_and_oi(s)
         if not info:
             continue
+
         # Filter 1: % change vs prev close ≥ PREMKT_THRESHOLD
         if info["pct_change"] >= PREMKT_THRESHOLD:
+            print(f"   ✅ [{s}] passed PREMKT_THRESHOLD ({info['pct_change']:.2f}% >= {PREMKT_THRESHOLD:.2f}%)")
             data.append(info)
+        else:
+            print(f"   ❎ [{s}] failed PREMKT_THRESHOLD ({info['pct_change']:.2f}% < {PREMKT_THRESHOLD:.2f}%)")
 
     if not data:
-        msg = f"⏳ No NIFTY 200 stocks ≥ +{PREMKT_THRESHOLD:.1f}% at 09:30 on {datetime.date.today().isoformat()}."
+        msg = f"⏳ No NIFTY stocks ≥ +{PREMKT_THRESHOLD:.1f}% at 09:30 on {datetime.date.today().isoformat()}."
+        print("\n" + msg)
         send_telegram_message(msg)
         return
 
+    # Build DataFrame of filtered stocks
     df = pd.DataFrame(data)
+    print(f"\n📊 {len(df)} symbols passed the 1st filter. Here's their data:")
+    print(df[["symbol", "pct_change", "industry", "oi_pct_change"]].to_string(index=False))
+    print()
 
-    # 4) Step 3: “Momentum sector” filter (≥ SECTOR_MIN_COUNT winners in the same industry)
+    # 4) Step 3: “Momentum sector” filter (≥ SECTOR_MIN_COUNT winners in same industry)
     sector_counts = df["industry"].value_counts()
+    print("📈 Sector counts among filtered symbols:")
+    for sector, count in sector_counts.items():
+        print(f"   • {sector}: {count} stock(s)")
+
     momentum_sectors = sector_counts[sector_counts >= SECTOR_MIN_COUNT].index.tolist()
     if not momentum_sectors:
         msg = (
             f"⚠️ No sector has ≥ {SECTOR_MIN_COUNT} stocks with +{PREMKT_THRESHOLD:.1f}% at 09:30.\n"
             f"Date: {datetime.date.today().isoformat()}"
         )
+        print("\n" + msg)
         send_telegram_message(msg)
         return
 
     # Pick the single sector with the highest count
     chosen_sector = sector_counts.idxmax()
+    print(f"\n🎯 Chosen sector: {chosen_sector} ({sector_counts[chosen_sector]} winners)")
+
     df = df[df["industry"] == chosen_sector].copy()
     if df.empty:
         msg = f"⚠️ After sector filter, 0 stocks remain in {chosen_sector}."
+        print("\n" + msg)
         send_telegram_message(msg)
         return
 
+    print(f"   → {len(df)} stocks remain after selecting sector '{chosen_sector}': {df['symbol'].tolist()}\n")
+
     # 5) Step 4: OI filter ≥ OI_THRESHOLD
+    print(f"🔍 Applying OI filter: keep only those with OI Δ ≥ {OI_THRESHOLD:.2f}%")
+    df_before_oi = df.copy()
     df = df[df["oi_pct_change"] >= OI_THRESHOLD].copy()
+
+    print("   • Before OI filter:", df_before_oi["symbol"].tolist())
+    print("   • After OI filter: ", df["symbol"].tolist())
+
     if df.empty:
         msg = (
             f"⚠️ No stocks in sector '{chosen_sector}' have OI Δ ≥ {OI_THRESHOLD:.1f}% at 09:30.\n"
             f"Date: {datetime.date.today().isoformat()}"
         )
+        print("\n" + msg)
         send_telegram_message(msg)
         return
 
     # 6) Sort by pct_change (descending) and pick top MAX_SYMBOLS_PER_DAY
     df = df.sort_values(by="pct_change", ascending=False).head(MAX_SYMBOLS_PER_DAY)
+    print(f"\n🏆 Top {MAX_SYMBOLS_PER_DAY} picks after sorting by pct_change:")
+    print(df[["symbol", "pct_change", "oi_pct_change"]].to_string(index=False), "\n")
 
     # 7) Build the Markdown Telegram message
     header = f"🟢 *9:30 Intraday Picks for {datetime.date.today().isoformat()}*\n"
@@ -198,15 +232,17 @@ def main():
         )
 
     footer = (
-        "\n⚠️ *Remember:*  ￼\n"
-        " • Place a *Bracket‐Order* if your broker supports it (Groww, AngelOne, Dhan).  ￼\n"
-        " • If no BO, place market/limit buy → set SL at above SL.  ￼\n"
-        " • Move SL to breakeven at +1.5%; trail SL by –1% once +2% hits.  ￼\n"
-        " • *Exit all positions by 10:30 AM* IST if neither SL nor target is hit.  ￼\n"
+        "\n⚠️ *Remember:*  \n"
+        " • Place a *Bracket‐Order* if your broker supports it (Groww, AngelOne, Dhan).  \n"
+        " • If no BO, place market/limit buy → set SL at above SL.  \n"
+        " • Move SL to breakeven at +1.5%; trail SL by –1% once +2% hits.  \n"
+        " • *Exit all positions by 10:30 AM* IST if neither SL nor target is hit.  \n"
         " • Stop trading for the day if you lose 2 full SLs (~₹1,500–₹2,000)."
     )
 
     full_message = header + "\n".join(lines) + footer
+
+    print("✉️ Sending Telegram message with final picks...\n")
     send_telegram_message(full_message)
 
 
