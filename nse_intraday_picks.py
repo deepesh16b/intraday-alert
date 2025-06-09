@@ -160,8 +160,8 @@ def fetch_quote_vol_rsi(symbol):
             vol_spike_pct = None
         else:
             hist = hist.tz_convert("Asia/Kolkata")
-            start_time = datetime.time(9, 30)
-            end_time   = datetime.time(9, 35)
+            start_time = datetime.time(9, 23)
+            end_time   = datetime.time(9, 28)
             mask = (hist.index.time >= start_time) & (hist.index.time < end_time)
             first_5min = hist.loc[mask]
 
@@ -169,7 +169,7 @@ def fetch_quote_vol_rsi(symbol):
                 today_5min_vol = int(first_5min["Volume"].sum())
                 vol_spike_pct = ((today_5min_vol - avg_5min_vol) / avg_5min_vol) * 100
             else:
-                print(f"⚠️ [{symbol}] No bars between 09:30–09:35 IST.")
+                print(f"⚠️ [{symbol}] No bars between 09:23–09:28 IST.")
                 vol_spike_pct = None
     except Exception as e:
         print(f"❌ [{symbol}] Intraday fetch failed: {e}")
